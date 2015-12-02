@@ -1,0 +1,1243 @@
+/**
+ * Backbone.Waiter
+ * Copyright (c)2015 Josh Allen
+ * Distributed under MIT license
+ * 
+ * Fork of 
+ * (MarionetteJS (Backbone.Marionette) v2.4.3
+ * Copyright (c)2015 Derick Bailey, Muted Solutions, LLC.
+ * Distributed under MIT license)
+ *
+ * Purpose of this library is to be a unobtrusive JS back end to 
+ * server rendered HTML.
+ * 
+ * 
+ */
+
+(function (root, factory) {
+
+    if (typeof define === 'function' && define.amd) {
+        define(['backbone', 'underscore'], function (Backbone, _) {
+            return (root.Waiter = root.Waiter = factory(root, Backbone, _));
+        });
+    } else if (typeof exports !== 'undefined') {
+        var Backbone = require('backbone');
+        var _ = require('underscore');
+        module.exports = factory(root, Backbone, _);
+    } else {
+        root.Waiter = root.Waiter = factory(root, root.Backbone, root._);
+    }
+
+}(this, function (root, Backbone, _) {
+    'use strict';
+
+    var Waiter = Backbone.Waiter = {};
+
+    // Borrow the Backbone `extend` method so we can use it as needed
+    Waiter.extend = Backbone.Model.extend;
+
+
+    // Waiter.isNodeAttached
+    // -------------------------
+
+    // Determine if `el` is a child of the document
+    Waiter.isNodeAttached = function (el) {
+        return Backbone.$.contains(document.documentElement, el);
+    };
+
+    // Merge `keys` from `options` onto `this`
+    Waiter.mergeOptions = function (options, keys) {
+        if (!options) { return; }
+        _.extend(this, _.pick(options, keys));
+    };
+
+    // Waiter.getOption
+    // --------------------
+
+    // Retrieve an object, function or other value from a target
+    // object or its `options`, with `options` taking precedence.
+    Waiter.getOption = function (target, optionName) {
+        if (!target || !optionName) { return; }
+        if (target.options && (target.options[optionName] !== undefined)) {
+            return target.options[optionName];
+        } else {
+            return target[optionName];
+        }
+    };
+
+    // Proxy `Waiter.getOption`
+    Waiter.proxyGetOption = function (optionName) {
+        return Waiter.getOption(this, optionName);
+    };
+
+    // Similar to `_.result`, this is a simple helper
+    // If a function is provided we call it with context
+    // otherwise just return the value. If the value is
+    // undefined return a default value
+    Waiter._getValue = function (value, context, params) {
+        if (_.isFunction(value)) {
+            value = params ? value.apply(context, params) : value.call(context);
+        }
+        return value;
+    };
+
+
+    // Waiter.normalizeMethods
+    // ----------------------
+
+    // Pass in a mapping of events => functions or function names
+    // and return a mapping of events => functions
+    Waiter.normalizeMethods = function (hash) {
+        return _.reduce(hash, function (normalizedHash, method, name) {
+            if (!_.isFunction(method)) {
+                method = this[method];
+            }
+            if (method) {
+                normalizedHash[name] = method;
+            }
+            return normalizedHash;
+        }, {}, this);
+    };
+
+    // utility method for parsing @ui. syntax strings
+    // into associated selector
+    Waiter.normalizeUIString = function (uiString, ui) {
+        return uiString.replace(/@ui\.[a-zA-Z_$0-9]*/g, function (r) {
+            return ui[r.slice(4)];
+        });
+    };
+
+    // allows for the use of the @ui. syntax within
+    // a given key for triggers and events
+    // swaps the @ui with the associated selector.
+    // Returns a new, non-mutated, parsed events hash.
+    Waiter.normalizeUIKeys = function (hash, ui) {
+        return _.reduce(hash, function (memo, val, key) {
+            var normalizedKey = Waiter.normalizeUIString(key, ui);
+            memo[normalizedKey] = val;
+            return memo;
+        }, {});
+    };
+
+    // allows for the use of the @ui. syntax within
+    // a given value for regions
+    // swaps the @ui with the associated selector
+    Waiter.normalizeUIValues = function (hash, ui, properties) {
+        _.each(hash, function (val, key) {
+            if (_.isString(val)) {
+                hash[key] = Waiter.normalizeUIString(val, ui);
+            } else if (_.isObject(val) && _.isArray(properties)) {
+                _.extend(val, Waiter.normalizeUIValues(_.pick(val, properties), ui));
+                /* Value is an object, and we got an array of embedded property names to normalize. */
+                _.each(properties, function (property) {
+                    var propertyVal = val[property];
+                    if (_.isString(propertyVal)) {
+                        val[property] = Waiter.normalizeUIString(propertyVal, ui);
+                    }
+                });
+            }
+        });
+        return hash;
+    };
+
+    /**
+    * Takes a string and evaluates it in some context.
+    * This is helpful for translating something like 'om.function',
+    * to the actual function.
+    * ex) 
+    * var grandChild = Waiter.evalString('namespace.child.grandChild');
+    * or
+    * var grandChild = Waiter.evalString('child.grandChild', namespace); // if you had a reference to namespace 
+    *
+    * @param {String} name String to evaluate
+    * @param {Object} context Context to evaluate under (defaults to window)
+    * @returns {Object} result of evaulation
+    */
+    Waiter.evalString = function (name, context) {
+        context = context || window;
+        var args = Array.prototype.slice.call(arguments).splice(2);
+        var namespaces = name.split(".");
+        var obj = namespaces.pop();
+        for(var i = 0; i < namespaces.length; i++) {
+            context = context[namespaces[i]];
+        }
+        return context[obj];
+    }
+
+
+    // Trigger Method
+    // --------------
+
+    Waiter._triggerMethod = (function () {
+        // split the event name on the ":"
+        var splitter = /(^|:)(\w)/gi;
+
+        // take the event section ("section1:section2:section3")
+        // and turn it in to uppercase name
+        function getEventName(match, prefix, eventName) {
+            return eventName.toUpperCase();
+        }
+
+        return function (context, event, args) {
+            var noEventArg = arguments.length < 3;
+            if (noEventArg) {
+                args = event;
+                event = args[0];
+            }
+
+            // get the method name from the event name
+            var methodName = 'on' + event.replace(splitter, getEventName);
+            var method = context[methodName];
+            var result;
+
+            // call the onMethodName if it exists
+            if (_.isFunction(method)) {
+                // pass all args, except the event name
+                result = method.apply(context, noEventArg ? _.rest(args) : args);
+            }
+
+            // trigger the event, if a trigger method exists
+            if (_.isFunction(context.trigger)) {
+                if (noEventArg + args.length > 1) {
+                    context.trigger.apply(context, noEventArg ? args : [event].concat(_.drop(args, 0)));
+                } else {
+                    context.trigger(event);
+                }
+            }
+
+            return result;
+        };
+    })();
+
+    // Trigger an event and/or a corresponding method name. Examples:
+    //
+    // `this.triggerMethod("foo")` will trigger the "foo" event and
+    // call the "onFoo" method.
+    //
+    // `this.triggerMethod("foo:bar")` will trigger the "foo:bar" event and
+    // call the "onFooBar" method.
+    Waiter.triggerMethod = function (event) {
+        return Waiter._triggerMethod(this, arguments);
+    };
+
+    // triggerMethodOn invokes triggerMethod on a specific context
+    //
+    // e.g. `Waiter.triggerMethodOn(view, 'show')`
+    // will trigger a "show" event or invoke onShow the view.
+    Waiter.triggerMethodOn = function (context) {
+        var fnc = _.isFunction(context.triggerMethod) ?
+                      context.triggerMethod :
+                      Waiter.triggerMethod;
+
+        return fnc.apply(context, _.rest(arguments));
+    };
+
+    // DOM Refresh
+    // -----------
+
+    // Monitor a view's state, and after it has been rendered and shown
+    // in the DOM, trigger a "dom:refresh" event every time it is
+    // re-rendered.
+
+    Waiter.MonitorDOMRefresh = function (view) {
+        if (view._isDomRefreshMonitored) { return; }
+        view._isDomRefreshMonitored = true;
+
+        // track when the view has been shown in the DOM,
+        // using a Waiter.Region (or by other means of triggering "show")
+        function handleShow() {
+            view._isShown = true;
+            triggerDOMRefresh();
+        }
+
+        // track when the view has been rendered
+        function handleRender() {
+            view._isRendered = true;
+            triggerDOMRefresh();
+        }
+
+        // Trigger the "dom:refresh" event and corresponding "onDomRefresh" method
+        function triggerDOMRefresh() {
+            if (view._isShown && view._isRendered && Waiter.isNodeAttached(view.el)) {
+                Waiter.triggerMethodOn(view, 'dom:refresh', view);
+            }
+        }
+
+        view.on({
+            show: handleShow,
+            render: handleRender
+        });
+    };
+
+    // Bind Entity Events & Unbind Entity Events
+    // -----------------------------------------
+    //
+    // These methods are used to bind/unbind a backbone "entity" (e.g. collection/model)
+    // to methods on a target object.
+    //
+    // The first parameter, `target`, must have the Backbone.Events module mixed in.
+    //
+    // The second parameter is the `entity` (Backbone.Model, Backbone.Collection or
+    // any object that has Backbone.Events mixed in) to bind the events from.
+    //
+    // The third parameter is a hash of { "event:name": "eventHandler" }
+    // configuration. Multiple handlers can be separated by a space. A
+    // function can be supplied instead of a string handler name.
+
+    (function (Waiter) {
+        'use strict';
+
+        // Bind the event to handlers specified as a string of
+        // handler names on the target object
+        function bindFromStrings(target, entity, evt, methods) {
+            var methodNames = methods.split(/\s+/);
+
+            _.each(methodNames, function (methodName) {
+
+                var method = target[methodName];
+                if (!method) {
+                    throw new Waiter.Error('Method "' + methodName +
+                      '" was configured as an event handler, but does not exist.');
+                }
+
+                target.listenTo(entity, evt, method);
+            });
+        }
+
+        // Bind the event to a supplied callback function
+        function bindToFunction(target, entity, evt, method) {
+            target.listenTo(entity, evt, method);
+        }
+
+        // Bind the event to handlers specified as a string of
+        // handler names on the target object
+        function unbindFromStrings(target, entity, evt, methods) {
+            var methodNames = methods.split(/\s+/);
+
+            _.each(methodNames, function (methodName) {
+                var method = target[methodName];
+                target.stopListening(entity, evt, method);
+            });
+        }
+
+        // Bind the event to a supplied callback function
+        function unbindToFunction(target, entity, evt, method) {
+            target.stopListening(entity, evt, method);
+        }
+
+        // generic looping function
+        function iterateEvents(target, entity, bindings, functionCallback, stringCallback) {
+            if (!entity || !bindings) { return; }
+
+            // type-check bindings
+            if (!_.isObject(bindings)) {
+                throw new Waiter.Error({
+                    message: 'Bindings must be an object or function.',
+                    url: 'Waiter.functions.html#Waiterbindentityevents'
+                });
+            }
+
+            // allow the bindings to be a function
+            bindings = Waiter._getValue(bindings, target);
+
+            // iterate the bindings and bind them
+            _.each(bindings, function (methods, evt) {
+
+                // allow for a function as the handler,
+                // or a list of event names as a string
+                if (_.isFunction(methods)) {
+                    functionCallback(target, entity, evt, methods);
+                } else {
+                    stringCallback(target, entity, evt, methods);
+                }
+
+            });
+        }
+
+        // Export Public API
+        Waiter.bindEntityEvents = function (target, entity, bindings) {
+            iterateEvents(target, entity, bindings, bindToFunction, bindFromStrings);
+        };
+
+        Waiter.unbindEntityEvents = function (target, entity, bindings) {
+            iterateEvents(target, entity, bindings, unbindToFunction, unbindFromStrings);
+        };
+
+        // Proxy `bindEntityEvents`
+        Waiter.proxyBindEntityEvents = function (entity, bindings) {
+            return Waiter.bindEntityEvents(this, entity, bindings);
+        };
+
+        // Proxy `unbindEntityEvents`
+        Waiter.proxyUnbindEntityEvents = function (entity, bindings) {
+            return Waiter.unbindEntityEvents(this, entity, bindings);
+        };
+    })(Waiter);
+
+
+    // Error
+    // -----
+
+    var errorProps = ['description', 'fileName', 'lineNumber', 'name', 'message', 'number'];
+
+    Waiter.Error = Waiter.extend.call(Error, {
+        constructor: function (message, options) {
+            if (_.isObject(message)) {
+                options = message;
+                message = options.message;
+            } else if (!options) {
+                options = {};
+            }
+
+            var error = Error.call(this, message);
+            _.extend(this, _.pick(error, errorProps), _.pick(options, errorProps));
+
+            this.captureStackTrace();
+
+        },
+
+        captureStackTrace: function () {
+            if (Error.captureStackTrace) {
+                Error.captureStackTrace(this, Waiter.Error);
+            }
+        },
+
+        toString: function () {
+            return this.name + ': ' + this.message;
+        }
+    });
+
+    Waiter.Error.extend = Waiter.extend;
+
+
+    // Object
+    // ------
+
+    // A Base Class that other Classes should descend from.
+    // Object borrows many conventions and utilities from Backbone.
+    Waiter.Object = function (options) {
+        this.options = _.extend({}, _.result(this, 'options'), options);
+
+        this.initialize.apply(this, arguments);
+    };
+
+    Waiter.Object.extend = Waiter.extend;
+
+    // Object Methods
+    // --------------
+
+    // Ensure it can trigger events with Backbone.Events
+    _.extend(Waiter.Object.prototype, Backbone.Events, {
+
+        //this is a noop method intended to be overridden by classes that extend from this base
+        initialize: function () { },
+
+        destroy: function () {
+            this.triggerMethod('before:destroy');
+            this.triggerMethod('destroy');
+            this.stopListening();
+
+            return this;
+        },
+
+        // Import the `triggerMethod` to trigger events with corresponding
+        // methods if the method exists
+        triggerMethod: Waiter.triggerMethod,
+
+        // A handy way to merge options onto the instance
+        mergeOptions: Waiter.mergeOptions,
+
+        // Proxy `getOption` to enable getting options from this or this.options by name.
+        getOption: Waiter.proxyGetOption,
+
+        // Proxy `bindEntityEvents` to enable binding view's events from another entity.
+        bindEntityEvents: Waiter.proxyBindEntityEvents,
+
+        // Proxy `unbindEntityEvents` to enable unbinding view's events from another entity.
+        unbindEntityEvents: Waiter.proxyUnbindEntityEvents
+    });
+
+    // View
+    // ----
+
+    // The core view class that other Waiter views extend from.
+    Waiter.View = Backbone.View.extend({
+        isDestroyed: false,
+        supportsRenderLifecycle: true,
+        supportsDestroyLifecycle: true,
+
+        constructor: function (options) {
+            this.render = _.bind(this.render, this);
+
+            options = Waiter._getValue(options, this);
+
+            // this exposes view options to the view initializer
+            // this is a backfill since backbone removed the assignment
+            // of this.options
+            // at some point however this may be removed
+            this.options = _.extend({}, _.result(this, 'options'), options);
+
+            this._behaviors = Waiter.Behaviors(this);
+
+            Backbone.View.call(this, this.options);
+
+            Waiter.MonitorDOMRefresh(this);
+        },
+
+        // Get the template for this view
+        // instance. You can set a `template` attribute in the view
+        // definition or pass a `template: "whatever"` parameter in
+        // to the constructor options.
+        getTemplate: function () {
+            return this.getOption('template');
+        },
+
+        // Serialize a model by returning its attributes. Clones
+        // the attributes to allow modification.
+        serializeModel: function (model) {
+            return model.toJSON.apply(model, _.rest(arguments));
+        },
+
+        // Mix in template helper methods. Looks for a
+        // `templateHelpers` attribute, which can either be an
+        // object literal, or a function that returns an object
+        // literal. All methods and attributes from this object
+        // are copies to the object passed in.
+        mixinTemplateHelpers: function (target) {
+            target = target || {};
+            var templateHelpers = this.getOption('templateHelpers');
+            templateHelpers = Waiter._getValue(templateHelpers, this);
+            return _.extend(target, templateHelpers);
+        },
+
+        // normalize the keys of passed hash with the views `ui` selectors.
+        // `{"@ui.foo": "bar"}`
+        normalizeUIKeys: function (hash) {
+            var uiBindings = _.result(this, '_uiBindings');
+            return Waiter.normalizeUIKeys(hash, uiBindings || _.result(this, 'ui'));
+        },
+
+        // normalize the values of passed hash with the views `ui` selectors.
+        // `{foo: "@ui.bar"}`
+        normalizeUIValues: function (hash, properties) {
+            var ui = _.result(this, 'ui');
+            var uiBindings = _.result(this, '_uiBindings');
+            return Waiter.normalizeUIValues(hash, uiBindings || ui, properties);
+        },
+
+        // Configure `triggers` to forward DOM events to view
+        // events. `triggers: {"click .foo": "do:foo"}`
+        configureTriggers: function () {
+            if (!this.triggers) { return; }
+
+            // Allow `triggers` to be configured as a function
+            var triggers = this.normalizeUIKeys(_.result(this, 'triggers'));
+
+            // Configure the triggers, prevent default
+            // action and stop propagation of DOM events
+            return _.reduce(triggers, function (events, value, key) {
+                events[key] = this._buildViewTrigger(value);
+                return events;
+            }, {}, this);
+        },
+
+        // Overriding Backbone.View's delegateEvents to handle
+        // the `triggers`, `modelEvents`, and `collectionEvents` configuration
+        delegateEvents: function (events) {
+            this._delegateDOMEvents(events);
+            this.bindEntityEvents(this.model, this.getOption('modelEvents'));
+            this.bindEntityEvents(this.collection, this.getOption('collectionEvents'));
+
+            _.each(this._behaviors, function (behavior) {
+                behavior.bindEntityEvents(this.model, behavior.getOption('modelEvents'));
+                behavior.bindEntityEvents(this.collection, behavior.getOption('collectionEvents'));
+            }, this);
+
+            return this;
+        },
+
+        // internal method to delegate DOM events and triggers
+        _delegateDOMEvents: function (eventsArg) {
+            var events = Waiter._getValue(eventsArg || this.events, this);
+
+            // normalize ui keys
+            events = this.normalizeUIKeys(events);
+            if (_.isUndefined(eventsArg)) { this.events = events; }
+
+            var combinedEvents = {};
+
+            // look up if this view has behavior events
+            var behaviorEvents = _.result(this, 'behaviorEvents') || {};
+            var triggers = this.configureTriggers();
+            var behaviorTriggers = _.result(this, 'behaviorTriggers') || {};
+
+            // behavior events will be overriden by view events and or triggers
+            _.extend(combinedEvents, behaviorEvents, events, triggers, behaviorTriggers);
+
+            Backbone.View.prototype.delegateEvents.call(this, combinedEvents);
+        },
+
+        // Overriding Backbone.View's undelegateEvents to handle unbinding
+        // the `triggers`, `modelEvents`, and `collectionEvents` config
+        undelegateEvents: function () {
+            Backbone.View.prototype.undelegateEvents.apply(this, arguments);
+
+            this.unbindEntityEvents(this.model, this.getOption('modelEvents'));
+            this.unbindEntityEvents(this.collection, this.getOption('collectionEvents'));
+
+            _.each(this._behaviors, function (behavior) {
+                behavior.unbindEntityEvents(this.model, behavior.getOption('modelEvents'));
+                behavior.unbindEntityEvents(this.collection, behavior.getOption('collectionEvents'));
+            }, this);
+
+            return this;
+        },
+
+        // Internal helper method to verify whether the view hasn't been destroyed
+        _ensureViewIsIntact: function () {
+            if (this.isDestroyed) {
+                throw new Waiter.Error({
+                    name: 'ViewDestroyedError',
+                    message: 'View (cid: "' + this.cid + '") has already been destroyed and cannot be used.'
+                });
+            }
+        },
+
+        // Default `destroy` implementation, for removing a view from the
+        // DOM and unbinding it. Regions will call this method
+        // for you. You can specify an `onDestroy` method in your view to
+        // add custom code that is called after the view is destroyed.
+        destroy: function () {
+            if (this.isDestroyed) { return this; }
+
+            var args = _.toArray(arguments);
+
+            this.triggerMethod.apply(this, ['before:destroy'].concat(args));
+
+            // mark as destroyed before doing the actual destroy, to
+            // prevent infinite loops within "destroy" event handlers
+            // that are trying to destroy other views
+            this.isDestroyed = true;
+            this.triggerMethod.apply(this, ['destroy'].concat(args));
+
+            // unbind UI elements
+            this.unbindUIElements();
+
+            this.isRendered = false;
+
+            // remove the view from the DOM
+            this.remove();
+
+            // Call destroy on each behavior after
+            // destroying the view.
+            // This unbinds event listeners
+            // that behaviors have registered for.
+            _.invoke(this._behaviors, 'destroy', args);
+
+            return this;
+        },
+
+        bindUIElements: function () {
+            this._bindUIElements();
+            _.invoke(this._behaviors, this._bindUIElements);
+        },
+
+        // This method binds the elements specified in the "ui" hash inside the view's code with
+        // the associated jQuery selectors.
+        _bindUIElements: function () {
+            if (!this.ui) { return; }
+
+            // store the ui hash in _uiBindings so they can be reset later
+            // and so re-rendering the view will be able to find the bindings
+            if (!this._uiBindings) {
+                this._uiBindings = this.ui;
+            }
+
+            // get the bindings result, as a function or otherwise
+            var bindings = _.result(this, '_uiBindings');
+
+            // empty the ui so we don't have anything to start with
+            this.ui = {};
+
+            // bind each of the selectors
+            _.each(bindings, function (selector, key) {
+                this.ui[key] = this.$(selector);
+            }, this);
+        },
+
+        // This method unbinds the elements specified in the "ui" hash
+        unbindUIElements: function () {
+            this._unbindUIElements();
+            _.invoke(this._behaviors, this._unbindUIElements);
+        },
+
+        _unbindUIElements: function () {
+            if (!this.ui || !this._uiBindings) { return; }
+
+            // delete all of the existing ui bindings
+            _.each(this.ui, function ($el, name) {
+                delete this.ui[name];
+            }, this);
+
+            // reset the ui element to the original bindings configuration
+            this.ui = this._uiBindings;
+            delete this._uiBindings;
+        },
+
+        // Internal method to create an event handler for a given `triggerDef` like
+        // 'click:foo'
+        _buildViewTrigger: function (triggerDef) {
+
+            var options = _.defaults({}, triggerDef, {
+                preventDefault: true,
+                stopPropagation: true
+            });
+
+            var eventName = _.isObject(triggerDef) ? options.event : triggerDef;
+
+            return function (e) {
+                if (e) {
+                    if (e.preventDefault && options.preventDefault) {
+                        e.preventDefault();
+                    }
+
+                    if (e.stopPropagation && options.stopPropagation) {
+                        e.stopPropagation();
+                    }
+                }
+
+                var args = {
+                    view: this,
+                    model: this.model,
+                    collection: this.collection
+                };
+
+                this.triggerMethod(eventName, args);
+            };
+        },
+
+        setElement: function () {
+            var ret = Backbone.View.prototype.setElement.apply(this, arguments);
+
+            // proxy behavior $el to the view's $el.
+            // This is needed because a view's $el proxy
+            // is not set until after setElement is called.
+            _.invoke(this._behaviors, 'proxyViewProperties', this);
+
+            return ret;
+        },
+
+        // import the `triggerMethod` to trigger events with corresponding
+        // methods if the method exists
+        triggerMethod: function () {
+            var ret = Waiter._triggerMethod(this, arguments);
+
+            this._triggerEventOnBehaviors(arguments);
+
+            //took this out not using parent views or layout yet.
+            //this._triggerEventOnParentLayout(arguments[0], _.rest(arguments));
+
+            return ret;
+        },
+
+        _triggerEventOnBehaviors: function (args) {
+            var triggerMethod = Waiter._triggerMethod;
+            var behaviors = this._behaviors;
+            // Use good ol' for as this is a very hot function
+            for (var i = 0, length = behaviors && behaviors.length; i < length; i++) {
+                triggerMethod(behaviors[i], args);
+            }
+        },
+
+        // Imports the "normalizeMethods" to transform hashes of
+        // events=>function references/names to a hash of events=>function references
+        normalizeMethods: Waiter.normalizeMethods,
+
+        // A handy way to merge passed-in options onto the instance
+        mergeOptions: Waiter.mergeOptions,
+
+        // Proxy `getOption` to enable getting options from this or this.options by name.
+        getOption: Waiter.proxyGetOption,
+
+        // Proxy `bindEntityEvents` to enable binding view's events from another entity.
+        bindEntityEvents: Waiter.proxyBindEntityEvents,
+
+        // Proxy `unbindEntityEvents` to enable unbinding view's events from another entity.
+        unbindEntityEvents: Waiter.proxyUnbindEntityEvents
+    });
+
+    // Item View
+    // ---------
+
+    // A single item view implementation that contains code for rendering
+    // with underscore.js templates, serializing the view's model or collection,
+    // and calling several methods on extended views, such as `onRender`.
+    Waiter.ItemView = Waiter.View.extend({
+
+        // Setting up the inheritance chain which allows changes to
+        // Waiter.View.prototype.constructor which allows overriding
+        constructor: function() {
+            Waiter.View.apply(this, arguments);
+        },
+
+        // Serialize the model or collection for the view. If a model is
+        // found, the view's `serializeModel` is called. If a collection is found,
+        // each model in the collection is serialized by calling
+        // the view's `serializeCollection` and put into an `items` array in
+        // the resulting data. If both are found, defaults to the model.
+        // You can override the `serializeData` method in your own view definition,
+        // to provide custom serialization for your view's data.
+        serializeData: function() {
+            if (!this.model && !this.collection) {
+                return {};
+            }
+
+            var args = [this.model || this.collection];
+            if (arguments.length) {
+                args.push.apply(args, arguments);
+            }
+
+            if (this.model) {
+                return this.serializeModel.apply(this, args);
+            } else {
+                return {
+                    items: this.serializeCollection.apply(this, args)
+                };
+            }
+        },
+
+        // Serialize a collection by serializing each of its models.
+        serializeCollection: function(collection) {
+            return collection.toJSON.apply(collection, _.rest(arguments));
+        },
+
+        //defaulting template to false for static templates
+        // this still leaves the functionalty to of underscore templates if need be
+        template: false,
+
+        // Render the view, defaulting to underscore.js templates.
+        // You can override this in your view definition to provide
+        // a very specific rendering for your view. In general, though,
+        // you should override the `Waiter.Renderer` object to
+        // change how Waiter renders views.
+        render: function () {
+            this._ensureViewIsIntact();
+
+            this.triggerMethod('before:render', this);
+
+            //this._renderTemplate();
+            this.isRendered = true;
+            this.bindUIElements();
+
+            this.triggerMethod('render', this);
+
+            return this;
+        },
+
+        // Internal method to render the template with the serialized data
+        // and template helpers via the `Marionette.Renderer` object.
+        // Throws an `UndefinedTemplateError` error if the template is
+        // any falsely value but literal `false`.
+        //_renderTemplate: function () {
+        //    var template = this.getTemplate();
+
+        //    // Allow template-less item views
+        //    if (template === false) {
+        //        return;
+        //    }
+
+        //    if (!template) {
+        //        throw new Waiter.Error({
+        //            name: 'UndefinedTemplateError',
+        //            message: 'Cannot render the template since it is null or undefined.'
+        //        });
+        //    }
+
+        //    // Add in entity data and template helpers
+        //    var data = this.mixinTemplateHelpers(this.serializeData());
+
+        //    // Render and add to el
+        //    var html = Waiter.Renderer.render(template, data, this);
+        //    this.attachElContent(html);
+
+        //    return this;
+        //},
+       
+
+        // Attaches the content of a given view.
+        // This method can be overridden to optimize rendering,
+        // or to render in a non standard way.
+        //
+        // For example, using `innerHTML` instead of `$el.html`
+        //
+        // ```js
+        // attachElContent: function(html) {
+        //   this.el.innerHTML = html;
+        //   return this;
+        // }
+        // ```
+        attachElContent: function (html) {
+            this.$el.html(html);
+
+            return this;
+        }
+    });
+
+
+
+    // Behavior
+    // --------
+
+    // A Behavior is an isolated set of DOM /
+    // user interactions that can be mixed into any View.
+    // Behaviors allow you to blackbox View specific interactions
+    // into portable logical chunks, keeping your views simple and your code DRY.
+
+    Waiter.Behavior = Waiter.Object.extend({
+        constructor: function (options, view) {
+            // Setup reference to the view.
+            // this comes in handle when a behavior
+            // wants to directly talk up the chain
+            // to the view.
+            this.view = view;
+            this.defaults = _.result(this, 'defaults') || {};
+            this.options = _.extend({}, this.defaults, options);
+            // Construct an internal UI hash using
+            // the views UI hash and then the behaviors UI hash.
+            // This allows the user to use UI hash elements
+            // defined in the parent view as well as those
+            // defined in the given behavior.
+            this.ui = _.extend({}, _.result(view, 'ui'), _.result(this, 'ui'));
+
+            Waiter.Object.apply(this, arguments);
+        },
+
+        // proxy behavior $ method to the view
+        // this is useful for doing jquery DOM lookups
+        // scoped to behaviors view.
+        $: function () {
+            return this.view.$.apply(this.view, arguments);
+        },
+
+        // Stops the behavior from listening to events.
+        // Overrides Object#destroy to prevent additional events from being triggered.
+        destroy: function () {
+            this.stopListening();
+
+            return this;
+        },
+
+        proxyViewProperties: function (view) {
+            this.$el = view.$el;
+            this.el = view.el;
+        }
+    });
+
+    /* jshint maxlen: 143 */
+    // Behaviors
+    // ---------
+
+    // Behaviors is a utility class that takes care of
+    // gluing your behavior instances to their given View.
+    // The most important part of this class is that you
+    // **MUST** override the class level behaviorsLookup
+    // method for things to work properly.
+
+    Waiter.Behaviors = (function (Waiter, _) {
+        // Borrow event splitter from Backbone
+        var delegateEventSplitter = /^(\S+)\s*(.*)$/;
+
+        function Behaviors(view, behaviors) {
+
+            if (!_.isObject(view.behaviors)) {
+                return {};
+            }
+
+            // Behaviors defined on a view can be a flat object literal
+            // or it can be a function that returns an object.
+            behaviors = Behaviors.parseBehaviors(view, behaviors || _.result(view, 'behaviors'));
+
+            // Wraps several of the view's methods
+            // calling the methods first on each behavior
+            // and then eventually calling the method on the view.
+            Behaviors.wrap(view, behaviors, _.keys(methods));
+            return behaviors;
+        }
+
+        var methods = {
+            behaviorTriggers: function (behaviorTriggers, behaviors) {
+                var triggerBuilder = new BehaviorTriggersBuilder(this, behaviors);
+                return triggerBuilder.buildBehaviorTriggers();
+            },
+
+            behaviorEvents: function (behaviorEvents, behaviors) {
+                var _behaviorsEvents = {};
+
+                _.each(behaviors, function (b, i) {
+                    var _events = {};
+                    var behaviorEvents = _.clone(_.result(b, 'events')) || {};
+
+                    // Normalize behavior events hash to allow
+                    // a user to use the @ui. syntax.
+                    behaviorEvents = Waiter.normalizeUIKeys(behaviorEvents, getBehaviorsUI(b));
+
+                    var j = 0;
+                    _.each(behaviorEvents, function (behaviour, key) {
+                        var match = key.match(delegateEventSplitter);
+
+                        // Set event name to be namespaced using the view cid,
+                        // the behavior index, and the behavior event index
+                        // to generate a non colliding event namespace
+                        // http://api.jquery.com/event.namespace/
+                        var eventName = match[1] + '.' + [this.cid, i, j++, ' '].join('');
+                        var selector = match[2];
+
+                        var eventKey = eventName + selector;
+                        var handler = _.isFunction(behaviour) ? behaviour : b[behaviour];
+
+                        _events[eventKey] = _.bind(handler, b);
+                    }, this);
+
+                    _behaviorsEvents = _.extend(_behaviorsEvents, _events);
+                }, this);
+
+                return _behaviorsEvents;
+            }
+        };
+
+        _.extend(Behaviors, {
+
+            // Placeholder method to be extended by the user.
+            // The method should define the object that stores the behaviors.
+            // i.e.
+            //
+            // ```js
+            // Waiter.Behaviors.behaviorsLookup: function() {
+            //   return App.Behaviors
+            // }
+            // ```
+            behaviorsLookup: function () {
+                throw new Waiter.Error({
+                    message: 'You must define where your behaviors are stored.',
+                    url: 'Waiter.behaviors.html#behaviorslookup'
+                });
+            },
+
+            // Takes care of getting the behavior class
+            // given options and a key.
+            // If a user passes in options.behaviorClass
+            // default to using that. Otherwise delegate
+            // the lookup to the users `behaviorsLookup` implementation.
+            getBehaviorClass: function (options, key) {
+                if (options.behaviorClass) {
+                    return options.behaviorClass;
+                }
+
+                // Get behavior class can be either a flat object or a method
+                return Waiter._getValue(Behaviors.behaviorsLookup, this, [options, key])[key];
+            },
+
+            // Iterate over the behaviors object, for each behavior
+            // instantiate it and get its grouped behaviors.
+            parseBehaviors: function (view, behaviors) {
+                return _.chain(behaviors).map(function (options, key) {
+                    var BehaviorClass = Behaviors.getBehaviorClass(options, key);
+
+                    var behavior = new BehaviorClass(options, view);
+                    var nestedBehaviors = Behaviors.parseBehaviors(view, _.result(behavior, 'behaviors'));
+
+                    return [behavior].concat(nestedBehaviors);
+                }).flatten().value();
+            },
+
+            // Wrap view internal methods so that they delegate to behaviors. For example,
+            // `onDestroy` should trigger destroy on all of the behaviors and then destroy itself.
+            // i.e.
+            //
+            // `view.delegateEvents = _.partial(methods.delegateEvents, view.delegateEvents, behaviors);`
+            wrap: function (view, behaviors, methodNames) {
+                _.each(methodNames, function (methodName) {
+                    view[methodName] = _.partial(methods[methodName], view[methodName], behaviors);
+                });
+            }
+        });
+
+        // Class to build handlers for `triggers` on behaviors
+        // for views
+        function BehaviorTriggersBuilder(view, behaviors) {
+            this._view = view;
+            this._behaviors = behaviors;
+            this._triggers = {};
+        }
+
+        _.extend(BehaviorTriggersBuilder.prototype, {
+            // Main method to build the triggers hash with event keys and handlers
+            buildBehaviorTriggers: function () {
+                _.each(this._behaviors, this._buildTriggerHandlersForBehavior, this);
+                return this._triggers;
+            },
+
+            // Internal method to build all trigger handlers for a given behavior
+            _buildTriggerHandlersForBehavior: function (behavior, i) {
+                var triggersHash = _.clone(_.result(behavior, 'triggers')) || {};
+
+                triggersHash = Waiter.normalizeUIKeys(triggersHash, getBehaviorsUI(behavior));
+
+                _.each(triggersHash, _.bind(this._setHandlerForBehavior, this, behavior, i));
+            },
+
+            // Internal method to create and assign the trigger handler for a given
+            // behavior
+            _setHandlerForBehavior: function (behavior, i, eventName, trigger) {
+                // Unique identifier for the `this._triggers` hash
+                var triggerKey = trigger.replace(/^\S+/, function (triggerName) {
+                    return triggerName + '.' + 'behaviortriggers' + i;
+                });
+
+                this._triggers[triggerKey] = this._view._buildViewTrigger(eventName);
+            }
+        });
+
+        function getBehaviorsUI(behavior) {
+            return behavior._uiBindings || behavior.ui;
+        }
+
+        return Behaviors;
+
+    })(Waiter, _);
+
+
+
+
+    // Application
+    // -----------
+
+    // Contain and manage the composite application as a whole.
+    // includes an event aggregator as `app.vent`
+    Waiter.Application = Waiter.Object.extend({
+        constructor: function (options) {
+            this.submodules = {};
+            _.extend(this, options);
+            this._initChannel();
+            Waiter.Object.apply(this, arguments);
+        },
+
+        // kick off all of the application's processes.
+        // initializes all of the regions that have been added
+        // to the app, and runs all of the initializer functions
+        start: function (options) {
+            this.triggerMethod('before:start', options);
+            this.triggerMethod('start', options);
+        },
+
+        // Internal method to setup the Wreqr.radio channel
+        _initChannel: function () {
+            this.channelName = _.result(this, 'channelName') || 'global';
+            this.channel = _.result(this, 'channel') || Backbone.Radio.channel(this.channelName);
+            this.vent = _.result(this, 'vent') || this.channel.vent;
+            this.commands = _.result(this, 'commands') || this.channel.commands;
+            this.reqres = _.result(this, 'reqres') || this.channel.reqres;
+        }
+    });
+
+
+    // ViewManager
+    //-----------
+
+    // A router of sorts of unobtrusive view loading
+    // when views are rendered server side
+    Waiter.ViewManager = function (options) {
+        this.options = _.extend({}, _.result(this, 'options'), options);
+        this.initialize.apply(this, arguments);
+
+        this._processViews();
+        this._processSelectors();
+
+        $(document).ready(_.bind(this._onDomReady, this));
+    };
+
+    Waiter.ViewManager.extend = Waiter.extend;
+
+    _.extend(Waiter.ViewManager.prototype, {
+
+        app: {},
+
+        views: {},
+
+        _selectors: [],
+
+        /**
+         * override-able method that gets called first. 
+         * @returns {} 
+         */
+        initialize: function () { },
+
+        _processViews: function () {
+            if (_.isObject(this.views)) {
+                var self = this;
+                this.views = _.mapObject(this.views, function (val, key) {
+                    var viewObj;
+
+                    if (_.isObject(val)) {
+                        viewObj = val;
+                    } else {
+
+                        if (_.isEmpty(self.app)) {
+                            viewObj = Waiter.evalString(val);
+                        } else {
+                            viewObj = Waiter.evalString(val, self.app);
+                        }
+
+                        //var sepStr = val.split(".");
+                        //viewObj = self.app.views;
+                        //for (var i = 0; i < sepStr.length; i++) {
+                        //    viewObj = viewObj[sepStr[i]];
+                        //}
+
+                        //viewObj = self.app.views[val];
+                    }
+
+                    return viewObj;
+                });
+            }
+        },
+
+        _processSelectors: function () {
+            this._selectors = _.keys(this.views);
+        },
+
+        _onDomReady: function () {
+            _.each(_.keys(this.views), _.bind(this._loadViews,this));
+            return this;
+        },
+
+        _loadViews: function (strSelector) {
+            if ($(strSelector).length > 0) {
+
+                if ($(strSelector).length === 1) {
+                    //selector exists on page load up view
+                    var view = new this.views[strSelector]({ el: strSelector });
+                    view.render();
+                } else {
+                    //we have multiple elements make a view for each
+                    //todo: find a way to hook these up to the correct el
+                    //for (var i = 0, len = $(strSelector).length; i < len; ++i) {
+                    //    var view = new this.views[strSelector]({ el: strSelector });
+                    //    view.render();
+                    //}
+                    
+                }
+                
+            }
+            return this;
+        }
+
+    });
+
+    
+
+
+
+    //////////////////////
+    return Waiter;
+}));
